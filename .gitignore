@@ -1,0 +1,14 @@
+
+.env
+__pycache__/
+*.pyc
+.env
+venv/
+best_cnn_model.pth
+cache_metadata_7500.json
+commercial_kv_cache_7500.pt
+Dockerfile
+cache_metadata.json
+docker-compose.yml
+test_client.py
+test.py
