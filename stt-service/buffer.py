@@ -41,7 +41,7 @@ class SpeechBuffer:
 
         print(f"📦 SpeechBuffer ready — no min length, max={max_speech_ms}ms")
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def push(self, frame: np.ndarray, is_voice: bool) -> np.ndarray | None:
         """Push one audio frame. Returns completed segment or None."""
         # Maintain pre-roll ring
