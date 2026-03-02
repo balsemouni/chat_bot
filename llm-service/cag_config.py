@@ -38,9 +38,10 @@ class CAGConfig:
     # MEMORY CONFIGURATION - OPTIMIZED FOR STABILITY + ZERO LATENCY
     # ========================================================================
     
-    # CRITICAL FIX: Reduced from 127k to 120k for better stability
-    # This prevents OOM errors and allows room for generation
-    max_context_tokens: int = 500    #
+    # CRITICAL FIX: Use a sensible default that matches the "safe" preset.
+    # The previous value of 500 is far too small for any real use and is
+    # inconsistent with every preset (all start at 4000+).
+    max_context_tokens: int = 4096    #
     
     # CRITICAL FIX: Increased from 100 to 256 tokens
     # This prevents mid-sentence cutoffs like "Can you please tell me what ❌ Error"

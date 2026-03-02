@@ -30,6 +30,11 @@ async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User
     return result.scalar_one_or_none()
 
 
+async def get_all_users(db: AsyncSession) -> list[User]:
+    result = await db.execute(select(User).order_by(User.created_at.desc()))
+    return result.scalars().all()
+
+
 async def create_user(
     db: AsyncSession,
     email: str,
@@ -57,17 +62,14 @@ async def authenticate_user(
 ) -> Optional[User]:
     user = await get_user_by_email(db, email)
     if not user:
-        # Timing-safe: still hash to prevent user enumeration
         verify_password(password, "$2b$12$fakehashfakehashfakehashfakehashfakehash")
         return None
 
-    # Check account lock
     if user.is_locked:
         logger.warning(f"Login attempt on locked account {user.email}")
-        return None  # Caller will raise appropriate error
+        return None
 
     if not verify_password(password, user.hashed_password):
-        # Increment failed attempts
         user.failed_login_attempts += 1
         if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
             user.locked_until = datetime.now(timezone.utc) + timedelta(
@@ -79,12 +81,10 @@ async def authenticate_user(
         await db.flush()
         return None
 
-    # Successful login — reset counters
     user.failed_login_attempts = 0
     user.locked_until = None
     user.last_login_at = datetime.now(timezone.utc)
     await db.flush()
-
     return user
 
 
@@ -125,7 +125,6 @@ async def deactivate_user(db: AsyncSession, user: User) -> User:
 
 
 async def delete_user_data(db: AsyncSession, user: User) -> None:
-    """GDPR right to erasure — anonymize PII."""
     user.email = f"deleted_{user.id}@deleted.invalid"
     user.username = f"deleted_{user.id}"
     user.full_name = None

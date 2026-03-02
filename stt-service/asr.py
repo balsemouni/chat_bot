@@ -1,34 +1,38 @@
 """
-asr.py — Zero-Latency GPU Streaming ASR
-========================================
+asr.py — Streaming Speech Recogniser
+=====================================
+Wraps faster-whisper with:
+  • real-time word-by-word generator  (transcribe_streaming)
+  • optional AI voice filtering       (skips TTS feedback)
+  • legacy full-text method           (transcribe)
 
-GPU optimizations vs v1:
-  - Whisper runs on FLOAT16 (half-precision) on CUDA → 2x throughput
-  - Model warmed up at startup (first inference is always slow)
-  - num_workers=4 for parallel segment decoding
-  - CTranslate2 inter_threads for max GPU utilization
-  - AI filtering uses cached async result — zero blocking
-  - transcribe_streaming() yields words immediately, no buffering
+Matches the constructor signature expected by main.py:
+    StreamingSpeechRecognizer(
+        model_size, device,
+        ai_detector_model_path, enable_ai_filtering,
+        compute_type,           # NEW – passed from main.py env var
+        num_workers,            # NEW – passed from main.py env var
+    )
 """
 
 from faster_whisper import WhisperModel
 import numpy as np
-import threading
-import logging
 
-logger = logging.getLogger("asr")
+# ── AI voice detector — soft import so the service starts even without it ──
+AIVoiceDetector = None
+try:
+    from core.ai_voice_detector import AIVoiceDetector
+except ImportError:
+    try:
+        from ai_voice_detector import AIVoiceDetector
+    except ImportError:
+        pass   # detector simply won't be available
 
 
 class StreamingSpeechRecognizer:
     """
-    Transcribes audio → streaming words, GPU-optimized.
-
-    Key GPU settings:
-      - compute_type="float16"  (GPU) or "int8_float16" (GPU, memory-efficient)
-      - beam_size=1             greedy, fastest path
-      - word_timestamps=True    per-word latency tracking
-      - vad_filter=False        VAD done upstream, skip redundant work
-      - num_workers=4           parallel decoder workers on GPU
+    Transcribes audio to text with real-time word streaming.
+    Includes optional AI voice detection to prevent transcribing TTS output.
     """
 
     def __init__(
@@ -38,149 +42,96 @@ class StreamingSpeechRecognizer:
         ai_detector_model_path: str = None,
         ai_detection_threshold: float = 0.7,
         enable_ai_filtering: bool = True,
-        compute_type: str = None,       # None = auto-detect best
-        num_workers: int = 4,
-        cpu_threads: int = 4,
+        # ── extra params forwarded from main.py ──────────────────────────
+        compute_type: str = None,       # None → auto-select
+        num_workers: int = 4,           # parallel Whisper workers
     ):
-        import torch
-        if torch.cuda.is_available():
-            device = "cuda"
-
-        # Auto-select best compute type
+        # ── resolve compute type ─────────────────────────────────────────
         if compute_type is None:
-            if device == "cuda":
-                # float16 is fastest on modern GPUs (Ampere+)
-                # int8_float16 saves VRAM with minimal quality loss
-                compute_type = "float16"
-            else:
-                compute_type = "int8"
+            compute_type = "float16" if device == "cuda" else "int8"
 
-        logger.info("Loading Whisper %s on %s [%s]…", model_size, device.upper(), compute_type)
+        print(f"Loading Whisper '{model_size}' on {device.upper()} "
+              f"[{compute_type}, {num_workers} workers]...")
 
         self.model = WhisperModel(
             model_size,
             device=device,
             compute_type=compute_type,
-            num_workers=num_workers,    # parallel segment decoders
-            cpu_threads=cpu_threads,    # preprocessing thread pool
+            num_workers=num_workers,
         )
-        self.device       = device
-        self._model_size  = model_size
 
-        # Warmup — first inference is always slow due to CUDA kernel compilation
-        self._warmup()
+        # ── AI voice detector ────────────────────────────────────────────
+        self.ai_detector = None
+        self.enable_ai_filtering = enable_ai_filtering and (AIVoiceDetector is not None)
 
-        # ── AI voice detector (async, non-blocking) ───────────────────────────
-        self.ai_detector      = None
-        self.enable_ai_filtering = enable_ai_filtering
-        self._ai_lock         = threading.Lock()
-        self._last_ai_result  = False
-        self._ai_busy         = False
-
-        if enable_ai_filtering and ai_detector_model_path:
+        if self.enable_ai_filtering and ai_detector_model_path:
             try:
-                from ai_voice_detector import AIVoiceDetector
                 self.ai_detector = AIVoiceDetector(
                     model_path=ai_detector_model_path,
                     device=device,
                     confidence_threshold=ai_detection_threshold,
                 )
-                logger.info("✅ AI voice filtering enabled in ASR")
-            except Exception as e:
-                logger.warning("AI detector failed in ASR: %s", e)
+                print("✅ AI voice filtering enabled in ASR")
+            except Exception as exc:
+                print(f"⚠️  AI detector failed in ASR: {exc}")
+                self.ai_detector = None
+        elif enable_ai_filtering and AIVoiceDetector is None:
+            print("⚠️  AIVoiceDetector not importable — AI filtering disabled")
 
-        logger.info("✅ ASR ready (%s, %s, %s)", model_size, device, compute_type)
+        print("✅ ASR ready")
 
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _warmup(self):
-        """Pre-compile CUDA kernels with a silent dummy inference."""
-        try:
-            silence = np.zeros(16000, dtype=np.float32)  # 1s of silence
-            list(self.model.transcribe(
-                silence,
-                beam_size=1,
-                word_timestamps=False,
-                condition_on_previous_text=False,
-                vad_filter=False,
-                language="en",
-            )[0])  # drain generator
-            logger.info("🔥 Whisper GPU warmed up")
-        except Exception as e:
-            logger.warning("Warmup failed (non-fatal): %s", e)
-
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── streaming ────────────────────────────────────────────────────────
 
     def transcribe_streaming(self, audio_data: np.ndarray, sample_rate: int = 16000):
         """
-        Generator — yields words as fast as Whisper produces them.
-
-        Optimized for PARTIAL audio (800ms chunks) as well as full utterances.
-        Uses cached AI detection result — never blocks on CNN inference.
+        Generator — yields individual words as Whisper decodes them.
+        Returns immediately (yields nothing) if AI voice is detected.
         """
-        if len(audio_data) == 0:
+        if self._is_ai_audio(audio_data, sample_rate):
             return
 
-        # ── AI check (cached — never blocks) ─────────────────────────────────
-        if self.enable_ai_filtering and self.ai_detector is not None:
-            with self._ai_lock:
-                is_ai = self._last_ai_result
-            if is_ai:
-                logger.debug("ASR: skipping AI audio (cached)")
-                return
-            self._trigger_ai_check_async(audio_data, sample_rate)
-
-        # ── Whisper GPU transcription ─────────────────────────────────────────
-        segments, _info = self.model.transcribe(
+        segments, _ = self.model.transcribe(
             audio_data,
-            beam_size=1,                        # greedy = fastest
-            word_timestamps=True,               # per-word timing
-            condition_on_previous_text=False,   # no context dependency
-            no_speech_threshold=0.3,            # less silence padding
-            compression_ratio_threshold=2.4,    # filter hallucinations
-            log_prob_threshold=-1.0,            # allow low-prob partials
-            vad_filter=False,                   # VAD done upstream
-            language="en",                      # skip language detection
+            beam_size=1,
+            word_timestamps=True,
         )
 
         for segment in segments:
             if hasattr(segment, "words") and segment.words:
                 for word_info in segment.words:
-                    w = word_info.word.strip()
-                    if w:
-                        yield w
+                    word = word_info.word.strip()
+                    if word:
+                        yield word
             else:
-                for w in segment.text.strip().split():
-                    if w:
-                        yield w
+                # Fallback: split segment text on whitespace
+                for word in segment.text.strip().split():
+                    if word:
+                        yield word
+
+    # ── legacy / blocking ────────────────────────────────────────────────
 
     def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
-        """Blocking transcription — returns full text string."""
-        return " ".join(self.transcribe_streaming(audio_data, sample_rate)).strip()
+        """
+        Returns the full transcription as a single string.
+        Returns "" if AI voice is detected.
+        """
+        if self._is_ai_audio(audio_data, sample_rate):
+            return ""
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Async AI detection
-    # ──────────────────────────────────────────────────────────────────────────
+        segments, _ = self.model.transcribe(audio_data, beam_size=1)
+        return " ".join(s.text for s in segments).strip()
 
-    def _trigger_ai_check_async(self, audio: np.ndarray, sr: int):
-        with self._ai_lock:
-            if self._ai_busy or len(audio) < sr * 0.3:
-                return
-            self._ai_busy = True
+    # ── internal ─────────────────────────────────────────────────────────
 
-        audio_copy = audio.copy()
-
-        def _run():
-            try:
-                is_ai, conf, _ = self.ai_detector.is_ai_voice(audio_copy, sr)
-                with self._ai_lock:
-                    self._last_ai_result = is_ai
-                    self._ai_busy        = False
-                if is_ai:
-                    logger.info("ASR AI-detect: AI voice (%.0f%%) — next skipped", conf * 100)
-            except Exception as e:
-                logger.warning("ASR AI-detect error: %s", e)
-                with self._ai_lock:
-                    self._ai_busy = False
-
-        threading.Thread(target=_run, daemon=True, name="asr-ai-check").start()
+    def _is_ai_audio(self, audio: np.ndarray, sr: int) -> bool:
+        """Returns True if the audio should be skipped (AI-generated)."""
+        if not self.enable_ai_filtering or self.ai_detector is None:
+            return False
+        try:
+            is_ai, confidence, _ = self.ai_detector.is_ai_voice(audio, sr)
+            if is_ai:
+                print(f"🤖 AI voice detected in ASR ({confidence:.1%}) — skipping")
+            return is_ai
+        except Exception as exc:
+            print(f"⚠️  AI detection error in ASR: {exc}")
+            return False   # safer default: transcribe anyway

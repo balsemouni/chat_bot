@@ -161,7 +161,9 @@ class CacheManager:
             self.cache_state.past_key_values = tuple(new_pkv)
 
         self.cache_state.token_count = N
-        self._cleanup_memory()
+        # NOTE: No empty_cache() here — truncation runs after every query and
+        # GPU memory is NOT actually freed by slicing tensors. Calling
+        # empty_cache() would force a costly driver round-trip for zero gain.
     
     def handle_overflow(self, query_tokens: int) -> bool:
         """Handle cache overflow according to policy"""

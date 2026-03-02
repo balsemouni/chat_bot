@@ -6,10 +6,12 @@ Centralized model and tokenizer loading with STREAMING support
 import torch
 import gc
 import asyncio
+from threading import Thread
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    TextIteratorStreamer,
 )
 
 
@@ -163,135 +165,67 @@ class ModelLoader:
     
     def stream_response(self, input_ids, attention_mask=None, max_new_tokens=None):
         """
-        Stream model response WORD BY WORD - FIXED VERSION
-        
+        Stream model response using TextIteratorStreamer.
+
+        LOGIC FIX: The previous implementation called model() once per token
+        in a Python loop, concatenating input_ids every step. This means for
+        a 256-token response the model processed 1 token, then 2 tokens, then
+        3 tokens … — O(n²) compute cost. It also got no benefit from the KV
+        cache because each forward pass started from scratch.
+
+        TextIteratorStreamer runs model.generate() (which uses the KV cache
+        correctly) in a background thread and yields decoded text chunks as
+        they arrive, giving true O(n) streaming with no wasted compute.
+
         Args:
-            input_ids: Input token IDs (torch.Tensor)
-            attention_mask: Attention mask (torch.Tensor, optional)
-            max_new_tokens: Maximum tokens to generate (uses config default if None)
-            
+            input_ids:       Input token IDs (torch.Tensor)
+            attention_mask:  Attention mask (torch.Tensor, optional)
+            max_new_tokens:  Maximum tokens to generate
+
         Yields:
-            Individual words IMMEDIATELY as they're generated
+            Text chunks as they are generated
         """
         if self.model is None:
             raise ValueError("Model not loaded. Call load_model_and_tokenizer() first.")
-        
+
         max_new_tokens = max_new_tokens or self.config.max_new_tokens
-        
-        # Keep track of generated text
-        char_buffer = []
-        generated_tokens = []
-        full_generated_text = ""  # Track full generated text for stop string detection
-        
-        # Stop strings that indicate the model is simulating conversation
-        stop_strings = [
-            "User:", "user:", "USER:",
-            "<|start_header_id|>user<|end_header_id|>",
-            "\nUser:", "\nuser:",
-        ]
-        
-        # Keep original input length
-        original_length = input_ids.shape[-1]
-        
-        with torch.no_grad():
-            # Generate tokens one at a time
-            for token_idx in range(max_new_tokens):
-                # Get next token
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=True
-                )
-                
-                next_token_logits = outputs.logits[:, -1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                
-                # Store generated token
-                generated_tokens.append(next_token.item())
-                
-                # Check for EOS - THIS IS CRITICAL
-                if next_token.item() == self.tokenizer.eos_token_id:
-                    # Flush any remaining characters in buffer
-                    if char_buffer:
-                        word = ''.join(char_buffer)
-                        if word.strip():  # Only yield if not empty
-                            yield word + ' '
-                    break
-                
-                # Decode ONLY the new token
-                token_text = self.tokenizer.decode(next_token[0], skip_special_tokens=True)
-                
-                # Add to full generated text for stop string detection
-                full_generated_text += token_text
-                
-                # Check if we hit a stop string (model trying to simulate conversation)
-                should_stop = False
-                for stop_str in stop_strings:
-                    if stop_str in full_generated_text:
-                        should_stop = True
-                        break
-                
-                if should_stop:
-                    # Flush buffer and stop
-                    if char_buffer:
-                        word = ''.join(char_buffer)
-                        if word.strip():
-                            yield word + ' '
-                    break
-                
-                # Check if we're generating repeated output (indicates loop)
-                if len(generated_tokens) > 10:
-                    # Check last 10 tokens for repetition
-                    last_10 = generated_tokens[-10:]
-                    if len(set(last_10)) <= 2:  # Only 1-2 unique tokens in last 10
-                        if char_buffer:
-                            word = ''.join(char_buffer)
-                            if word.strip():
-                                yield word + ' '
-                        break
-                
-                # Process character by character for instant word detection
-                for char in token_text:
-                    # Word boundary detected (space, tab, newline)
-                    if char in ' \t\n':
-                        if char_buffer:
-                            word = ''.join(char_buffer)
-                            char_buffer = []
-                            # ⚡ YIELD WORD IMMEDIATELY (with trailing space)
-                            if word.strip():  # Only yield non-empty words
-                                yield word + ' '
-                    
-                    # Punctuation that ends a word
-                    elif char in '.,!?;:':
-                        # Yield current word if exists
-                        if char_buffer:
-                            word = ''.join(char_buffer)
-                            char_buffer = []
-                            if word.strip():
-                                yield word
-                        # ⚡ YIELD PUNCTUATION IMMEDIATELY (with space)
-                        yield char + ' '
-                    
-                    else:
-                        # Regular character - build current word
-                        char_buffer.append(char)
-                
-                # CRITICAL FIX: Update input_ids for next iteration
-                # This is necessary for the model to continue generation
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-                
-                # Update attention mask if provided
-                if attention_mask is not None:
-                    attention_mask = torch.cat([
-                        attention_mask,
-                        torch.ones((1, 1), device=attention_mask.device, dtype=attention_mask.dtype)
-                    ], dim=-1)
-        
-        # Yield any remaining word at end of generation
-        if char_buffer:
-            final_word = ''.join(char_buffer)
-            if final_word.strip():
-                yield final_word
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            timeout=30.0,
+        )
+
+        gen_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            streamer=streamer,
+            do_sample=False,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
+            num_beams=1,
+            repetition_penalty=1.0,
+        )
+        # Remove None kwargs (attention_mask may be None)
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
+
+        def _generate():
+            with torch.no_grad():
+                with torch.amp.autocast('cuda'):
+                    self.model.generate(**gen_kwargs)
+
+        thread = Thread(target=_generate)
+        thread.start()
+
+        try:
+            for chunk in streamer:
+                if chunk:
+                    yield chunk
+        finally:
+            thread.join(timeout=10.0)
     
     def stream_text_response(self, text_input, max_new_tokens=None):
         """
@@ -324,123 +258,38 @@ class ModelLoader:
     
     async def stream_response_async(self, input_ids, attention_mask=None, max_new_tokens=None):
         """
-        Async version - yields INDIVIDUAL WORDS IMMEDIATELY
-        
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask (optional)
-            max_new_tokens: Maximum tokens to generate
-            
-        Yields:
-            Individual words as they're generated
+        Async wrapper over stream_response — uses TextIteratorStreamer via a thread-pool
+        executor so the event loop is never blocked.
+
+        LOGIC FIX: Same O(n²) problem as the sync version was. Now delegates to
+        the corrected sync method and bridges it to async callers through a Queue.
         """
         if self.model is None:
             raise ValueError("Model not loaded. Call load_model_and_tokenizer() first.")
-        
-        max_new_tokens = max_new_tokens or self.config.max_new_tokens
-        char_buffer = []
-        generated_tokens = []
-        full_generated_text = ""  # Track for stop strings
-        
-        # Stop strings
-        stop_strings = [
-            "User:", "user:", "USER:",
-            "<|start_header_id|>user<|end_header_id|>",
-            "\nUser:", "\nuser:",
-        ]
-        
-        with torch.no_grad():
-            for token_idx in range(max_new_tokens):
-                # Get next token
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=True
-                )
-                
-                next_token_logits = outputs.logits[:, -1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                
-                generated_tokens.append(next_token.item())
-                
-                # Check for EOS
-                if next_token.item() == self.tokenizer.eos_token_id:
-                    if char_buffer:
-                        word = ''.join(char_buffer)
-                        if word.strip():
-                            yield word + ' '
-                    break
-                
-                # Decode the token
-                token_text = self.tokenizer.decode(next_token[0], skip_special_tokens=True)
-                
-                # Add to full text for stop detection
-                full_generated_text += token_text
-                
-                # Check for stop strings
-                should_stop = False
-                for stop_str in stop_strings:
-                    if stop_str in full_generated_text:
-                        should_stop = True
-                        break
-                
-                if should_stop:
-                    if char_buffer:
-                        word = ''.join(char_buffer)
-                        if word.strip():
-                            yield word + ' '
-                    break
-                
-                # Check for repetition
-                if len(generated_tokens) > 10:
-                    last_10 = generated_tokens[-10:]
-                    if len(set(last_10)) <= 2:
-                        if char_buffer:
-                            word = ''.join(char_buffer)
-                            if word.strip():
-                                yield word + ' '
-                        break
-                
-                # Process EACH CHARACTER for instant word detection
-                for char in token_text:
-                    # Word boundary: space, tab, newline
-                    if char in ' \t\n':
-                        if char_buffer:
-                            word = ''.join(char_buffer)
-                            char_buffer = []
-                            if word.strip():
-                                yield word + ' '
-                    
-                    # Punctuation that ends a word
-                    elif char in '.,!?;:':
-                        if char_buffer:
-                            word = ''.join(char_buffer)
-                            char_buffer = []
-                            if word.strip():
-                                yield word
-                        yield char + ' '
-                    
-                    else:
-                        # Build current word
-                        char_buffer.append(char)
-                
-                # Update for next iteration
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-                if attention_mask is not None:
-                    attention_mask = torch.cat([
-                        attention_mask,
-                        torch.ones((1, 1), device=attention_mask.device, dtype=attention_mask.dtype)
-                    ], dim=-1)
-                
-                # Yield control to event loop
-                await asyncio.sleep(0)
-        
-        # Yield remaining word
-        if char_buffer:
-            final_word = ''.join(char_buffer)
-            if final_word.strip():
-                yield final_word
-    
+
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def _producer():
+            try:
+                for chunk in self.stream_response(input_ids, attention_mask, max_new_tokens):
+                    loop.call_soon_threadsafe(q.put_nowait, ("chunk", chunk))
+            except Exception as exc:
+                loop.call_soon_threadsafe(q.put_nowait, ("error", str(exc)))
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+
+        loop.run_in_executor(None, _producer)
+
+        while True:
+            kind, value = await q.get()
+            if kind == "chunk":
+                yield value
+            elif kind == "error":
+                raise RuntimeError(value)
+            else:
+                break
+
     async def stream_text_response_async(self, text_input, max_new_tokens=None):
         """
         Async stream response from text input

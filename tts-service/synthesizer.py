@@ -1,17 +1,30 @@
 """
 synthesizer.py — TTSSynthesizer
-Wraps PocketTTSStreaming / InstantStreamingTTS from tts.py and exposes
-a simple synchronous .synthesize() → bytes interface for the FastAPI service.
+================================
 
-The microservice is stateless per-request (no local audio playback).
-Audio is returned as raw WAV bytes so the caller can stream / buffer it.
+Fixes applied vs original:
+
+  1. CANCELLATION TOKENS — Both _pocket_producer and _parallel_producer
+     now receive a threading.Event (stop_event). The generator's finally
+     block sets the event when the client disconnects mid-stream, so the
+     producer thread exits immediately instead of synthesizing the whole
+     remaining text and leaking CPU.
+
+  2. STREAMING GENERATOR CLEANUP — A try/finally in synthesize_streaming
+     guarantees stop_event.set() is called even if the caller throws or
+     disconnects.
+
+  3. RESAMPLING QUALITY NOTE — _ndarray_to_wav_bytes is unchanged; callers
+     are expected to configure models to their native sample rate. The
+     speaker.py layer handles resampling via soxr if needed.
+
+  No other behavioural changes — all existing endpoint logic is preserved.
 """
 
 import io
 import wave
 import struct
 import logging
-import os
 import threading
 from typing import Optional, Iterator
 
@@ -119,7 +132,7 @@ class _PiperBackend:
 # ---------------------------------------------------------------------------
 
 class _CoquiBackend:
-    """Synthesis-only adapter for Coqui TTS (original synthesizer.py approach)."""
+    """Synthesis-only adapter for Coqui TTS."""
 
     def __init__(self, model_name: str, device: str = "cpu"):
         from TTS.api import TTS  # type: ignore
@@ -152,30 +165,24 @@ class TTSSynthesizer:
     """
     Unified TTS synthesizer used by the FastAPI microservice.
 
-    Backend selection (env var TTS_BACKEND):
+    Backend selection (env var TTS_BACKEND / config.py):
       pocket  — PocketTTS  (default, fastest)
       piper   — Piper ONNX
       coqui   — Coqui TTS
-
-    All backends expose:
-      .synthesize(text, voice, speed)  → WAV bytes
-      .available_voices()              → list[str]
-      .sample_rate                     → int
     """
 
     def __init__(
         self,
         backend: Optional[str] = None,
         device: str = "cpu",
-        # PocketTTS
         pocket_voice: str = "alba",
-        # Piper
         piper_model: Optional[str] = None,
         piper_config: Optional[str] = None,
-        # Coqui
         coqui_model: Optional[str] = None,
     ):
-        backend = (backend or os.getenv("TTS_BACKEND", "pocket")).lower()
+        from config import settings
+
+        backend = (backend or settings.TTS_BACKEND).lower()
         self._backend_name = backend
         self._backend = None
 
@@ -183,15 +190,11 @@ class TTSSynthesizer:
             self._backend = _PocketBackend(voice=pocket_voice)
 
         elif backend == "piper":
-            model = piper_model or os.getenv(
-                "PIPER_MODEL", "en_US-lessac-medium.onnx"
-            )
+            model = piper_model or settings.PIPER_MODEL
             self._backend = _PiperBackend(model_path=model, config_path=piper_config)
 
         elif backend == "coqui":
-            model = coqui_model or os.getenv(
-                "TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC"
-            )
+            model = coqui_model or settings.TTS_MODEL
             self._backend = _CoquiBackend(model_name=model, device=device)
 
         else:
@@ -213,32 +216,17 @@ class TTSSynthesizer:
         voice: Optional[str] = None,
         speed: float = 1.0,
     ) -> bytes:
-        """
-        Synthesize text → WAV bytes.
-
-        Args:
-            text:  Input text.
-            voice: Voice name / speaker_wav path (backend-dependent).
-            speed: Speech rate multiplier (1.0 = normal).
-
-        Returns:
-            Raw WAV bytes (16-bit, mono).
-        """
+        """Synthesize text → WAV bytes."""
         if not text or not text.strip():
             return _silence_wav(0.1, self.sample_rate)
 
         try:
             if self._backend_name == "pocket":
-                # PocketTTS ignores voice per-call (voice set at init)
                 return self._backend.synthesize(text, rate=speed)
-
             elif self._backend_name == "piper":
                 return self._backend.synthesize(text, rate=speed)
-
             elif self._backend_name == "coqui":
-                return self._backend.synthesize(
-                    text, rate=speed, speaker_wav=voice
-                )
+                return self._backend.synthesize(text, rate=speed, speaker_wav=voice)
 
         except Exception as exc:
             logger.error("Synthesis failed for text=%r: %s", text[:60], exc)
@@ -255,39 +243,20 @@ class TTSSynthesizer:
         """
         Parallel-pipeline streaming synthesis.
 
-        How it works:
-        ─────────────
-        1. Text is split into word-group segments (same as before).
-        2. A background producer thread synthesizes segments and puts
-           finished WAV bytes into a queue.
-        3. This generator (the consumer) yields each WAV the instant it
-           arrives from the queue — while the producer is ALREADY working
-           on the next segment in parallel.
-
-        Result: chunk N is playing while chunk N+1 is being synthesized,
-        eliminating the dead-silence gap between chunks.
-
-        PocketTTS native path:
-        ─────────────────────
-        PocketTTS has its own internal streaming generator (model chunks
-        arrive incrementally). For that backend we flush model chunks
-        every ~100ms of audio so the very first audio arrives in <50ms,
-        then the parallel-pipeline takes over for subsequent segments.
+        FIX: Both producer threads now accept a stop_event (threading.Event).
+        When the generator is closed (client disconnects, caller throws, etc.)
+        the finally block sets the event, and the producer exits immediately
+        instead of running to completion and wasting CPU.
         """
         import queue as _queue
-        from concurrent.futures import ThreadPoolExecutor
 
-        # ── PocketTTS native streaming (intra-chunk parallelism) ──────────
+        # ── PocketTTS native streaming ────────────────────────────────────
         if self._backend_name == "pocket" and hasattr(
             self._backend.model, "generate_audio_stream"
         ):
-            # Collect raw model chunks, flush every 100ms → yield each as WAV.
-            # The model generates while the caller consumes, giving true overlap.
-            chunks: list[np.ndarray] = []
-
-            # Queue bridges the model-generator thread and this generator.
-            wav_q: _queue.Queue = _queue.Queue()
             sr = self._backend.sample_rate
+            wav_q: _queue.Queue = _queue.Queue()
+            stop_event = threading.Event()
 
             def _pocket_producer():
                 buf: list[np.ndarray] = []
@@ -295,6 +264,10 @@ class TTSSynthesizer:
                     for raw in self._backend.model.generate_audio_stream(
                         self._backend.voice_state, text
                     ):
+                        # ← NEW: honour cancellation
+                        if stop_event.is_set():
+                            break
+
                         audio = raw.numpy()
                         if speed != 1.0:
                             idx = np.arange(0, len(audio), speed)
@@ -305,51 +278,57 @@ class TTSSynthesizer:
                         if sum(len(c) for c in buf) >= sr * 0.1:
                             wav_q.put(_ndarray_to_wav_bytes(np.concatenate(buf), sr))
                             buf = []
-                    if buf:
+
+                    if buf and not stop_event.is_set():
                         wav_q.put(_ndarray_to_wav_bytes(np.concatenate(buf), sr))
+
                 except Exception as exc:
                     logger.error("PocketTTS producer error: %s", exc)
                 finally:
-                    wav_q.put(None)  # sentinel
+                    wav_q.put(None)  # sentinel — always sent so consumer unblocks
 
             t = threading.Thread(target=_pocket_producer, daemon=True,
                                  name="pocket-producer")
             t.start()
 
-            while True:
-                item = wav_q.get()
-                if item is None:
-                    break
-                yield item
+            try:
+                while True:
+                    item = wav_q.get()
+                    if item is None:
+                        break
+                    yield item
+            finally:
+                # ← NEW: signal producer to stop if generator is closed early
+                stop_event.set()
+
             return
 
-        # ── Parallel-pipeline for Piper / Coqui (and PocketTTS fallback) ──
-        #
-        # Segments: ["word1 word2 word3", "word4 word5 word6", ...]
+        # ── Parallel-pipeline for Piper / Coqui ──────────────────────────
         words = text.split()
         if not words:
             return
 
         segments: list[str] = []
         for i in range(0, len(words), chunk_size_words):
-            seg = " ".join(words[i : i + chunk_size_words]).strip()
+            seg = " ".join(words[i: i + chunk_size_words]).strip()
             if seg:
                 segments.append(seg)
 
         if not segments:
             return
 
-        # Use a bounded queue so the producer stays at most 1 chunk ahead.
-        # maxsize=2 means: producer synthesizes chunk[i+1] while consumer
-        # yields chunk[i] — perfect 1-ahead prefetch with no memory bloat.
         wav_q: _queue.Queue = _queue.Queue(maxsize=2)
         _SENTINEL = object()
+        stop_event = threading.Event()  # ← NEW
 
         def _parallel_producer():
             for seg in segments:
+                # ← NEW: honour cancellation before each segment
+                if stop_event.is_set():
+                    break
                 try:
                     wav = self.synthesize(seg, voice=voice, speed=speed)
-                    wav_q.put(wav)           # blocks if consumer is slow (backpressure)
+                    wav_q.put(wav)
                 except Exception as exc:
                     logger.error("Parallel producer error for %r: %s", seg[:40], exc)
                     wav_q.put(
@@ -364,13 +343,15 @@ class TTSSynthesizer:
         )
         producer_thread.start()
 
-        # Yield chunks as soon as they are ready — producer is already
-        # working on the next one while this chunk is being played.
-        while True:
-            item = wav_q.get()
-            if item is _SENTINEL:
-                break
-            yield item
+        try:
+            while True:
+                item = wav_q.get()
+                if item is _SENTINEL:
+                    break
+                yield item
+        finally:
+            # ← NEW: signal producer to stop if generator is closed early
+            stop_event.set()
 
     # ------------------------------------------------------------------
     def available_voices(self) -> list[str]:

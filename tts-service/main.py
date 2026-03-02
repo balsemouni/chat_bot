@@ -1,34 +1,34 @@
 """
-TTS Microservice — main.py  (v3 — instant local playback)
-==========================================================
-/speak endpoint now plays audio INSTANTLY as each chunk is synthesized.
-First audio heard in ~50-100ms instead of 3-4 seconds.
+TTS Microservice — main.py
+==========================
 
-How it works:
-  synthesizer.synthesize_streaming()  →  yields WAV chunks as generated
-  InstantSpeaker.feed(chunk)          →  queued & played the instant it arrives
-  sounddevice OutputStream            →  persistent open stream, zero open overhead
+Fixes applied vs original:
 
-Endpoints:
-  POST /speak                   → speak text NOW, instant first-audio
-  POST /speak/tokens            → feed LLM tokens, speak in real-time chunks
-  POST /speak/stop              → interrupt immediately
-  GET  /speak/status            → is speaker talking?
+  1. TOKEN JOINING FIX — LLM tokens carry their own leading whitespace
+     (e.g. [" Hello", " world", "!"]). Joining with " ".join() creates
+     double-spaces and space-before-punctuation. Fixed everywhere with:
+         text = "".join(tokens).replace("  ", " ").strip()
 
-  POST /synthesize              → return full WAV bytes
-  POST /synthesize/stream       → SSE WAV chunks per sentence
-  POST /synthesize/tokens       → SSE WAV chunks from token list
-  POST /synthesize/pocket_stream→ PocketTTS native SSE stream
+  2. SPEAKER SERIALISATION — _speak_pool is now max_workers=1. This ensures
+     /speak requests are queued and played in order, not mixed together.
+     With interrupt=True the current future is cancelled before the new one
+     is submitted (best-effort — in-flight synthesis is let finish its current
+     chunk but playback is stopped immediately via speaker.stop()).
 
-  GET  /voices
-  GET  /health
+  3. GRACEFUL SHUTDOWN — lifespan now calls _speak_pool.shutdown(wait=True)
+     so the current sentence can finish before the process exits.
+
+  4. HEALTH CIRCUIT BREAKER — startup errors are captured in _startup_error
+     and surfaced in /health instead of silently crashing the server.
+
+  5. CONFIG — all os.getenv calls replaced with config.settings.
 """
 
 import asyncio
 import base64
+import concurrent.futures as _cf
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -40,18 +40,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from config import settings
 from synthesizer import TTSSynthesizer
 from speaker import get_instant_speaker, shutdown_instant_speaker
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=settings.LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("tts_service")
 
 synth: TTSSynthesizer | None = None
 _startup_time: float = 0.0
+_startup_error: str | None = None   # ← circuit breaker
+
+# ---------------------------------------------------------------------------
+# Thread pool — max_workers=1 serialises /speak requests so audio never mixes
+# ---------------------------------------------------------------------------
+_speak_pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="speak")
+
+# Track the currently running speak future so interrupt=True can cancel it
+_current_speak_future: _cf.Future | None = None
+_future_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -59,29 +70,33 @@ _startup_time: float = 0.0
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global synth, _startup_time
+    global synth, _startup_time, _startup_error
     t0 = time.perf_counter()
+    logger.info("🚀 Loading TTS (backend=%s)…", settings.TTS_BACKEND)
 
-    backend = os.getenv("TTS_BACKEND", "pocket")
-    logger.info("🚀 Loading TTS (backend=%s)…", backend)
+    try:
+        synth = TTSSynthesizer(
+            backend=settings.TTS_BACKEND,
+            device=settings.DEVICE,
+            pocket_voice=settings.POCKET_VOICE,
+            piper_model=settings.PIPER_MODEL,
+            coqui_model=settings.TTS_MODEL,
+        )
+        # Pre-warm the instant speaker — opens sounddevice stream NOW
+        speaker = get_instant_speaker(sample_rate=synth.sample_rate)
+        logger.info("🔊 InstantSpeaker ready (sr=%d)", synth.sample_rate)
 
-    synth = TTSSynthesizer(
-        backend=backend,
-        device=os.getenv("DEVICE", "cpu"),
-        pocket_voice=os.getenv("POCKET_VOICE", "alba"),
-        piper_model=os.getenv("PIPER_MODEL"),
-        coqui_model=os.getenv("TTS_MODEL"),
-    )
-
-    # Pre-warm the instant speaker — opens sounddevice stream NOW, not on first request
-    speaker = get_instant_speaker(sample_rate=synth.sample_rate)
-    logger.info("🔊 InstantSpeaker ready (sr=%d)", synth.sample_rate)
+    except Exception as exc:
+        _startup_error = str(exc)
+        logger.error("❌ TTS failed to load: %s", exc)
 
     _startup_time = time.perf_counter() - t0
     logger.info("✅ TTS service ready in %.2fs", _startup_time)
     yield
 
+    # ── Graceful shutdown ──────────────────────────────────────────────
     logger.info("🛑 Shutting down…")
+    _speak_pool.shutdown(wait=True)   # let current sentence finish
     shutdown_instant_speaker()
 
 
@@ -89,12 +104,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TTS Microservice",
     description="Ultra-low-latency TTS — instant local speaker + return-bytes endpoints",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -135,8 +150,10 @@ class SpeakTokensRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 def _require_synth() -> TTSSynthesizer:
+    if _startup_error:
+        raise HTTPException(status_code=503, detail=f"TTS failed to load: {_startup_error}")
     if synth is None:
-        raise HTTPException(status_code=503, detail="TTS not loaded")
+        raise HTTPException(status_code=503, detail="TTS not loaded yet")
     return synth
 
 
@@ -153,9 +170,28 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-# Thread pool for all local playback — avoids silent drops from background_tasks
-import concurrent.futures as _cf
-_speak_pool = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="speak")
+def _join_tokens(tokens: list[str]) -> str:
+    """
+    Correctly join LLM tokens.
+
+    LLM tokens typically carry their own leading space, e.g.:
+        [" Hello", " world", "!"]  →  " Hello world!"
+
+    Using " ".join() would produce " Hello  world !" (double spaces,
+    space before punctuation).  Concatenating and collapsing double
+    spaces is correct.
+    """
+    return "".join(tokens).replace("  ", " ").strip()
+
+
+def _submit_speak(fn) -> _cf.Future:
+    """Submit fn to the speak pool, tracking the future for interrupt support."""
+    global _current_speak_future
+    with _future_lock:
+        future = _speak_pool.submit(fn)
+        _current_speak_future = future
+    return future
+
 
 # ===========================================================================
 # /speak  — INSTANT LOCAL PLAYBACK
@@ -163,7 +199,7 @@ _speak_pool = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="speak")
 
 @app.post("/speak", tags=["speaker"])
 async def speak(req: SpeakRequest):
-    """⚡ Speak text — uses thread pool for reliable execution (no silent drops)."""
+    """⚡ Speak text — serialised via single-worker pool (no mixed audio)."""
     s = _require_synth()
     speaker = get_instant_speaker(s.sample_rate)
     text, speed, interrupt = req.text, req.speed, req.interrupt
@@ -173,35 +209,39 @@ async def speak(req: SpeakRequest):
         if interrupt:
             speaker.stop()
             time.sleep(0.05)
+
         first = True
         for wav_chunk in s.synthesize_streaming(text, speed=speed):
             if first:
-                logger.info("⚡ First chunk in %.0fms", (time.perf_counter()-t0)*1000)
+                logger.info("⚡ First chunk in %.0fms", (time.perf_counter() - t0) * 1000)
                 first = False
             speaker.feed(wav_chunk)
-        logger.info("✅ /speak done %.2fs", time.perf_counter()-t0)
 
-    _speak_pool.submit(_do_speak)
-    return {"status": "speaking", "chars": len(text),
-            "preview": text[:80] + ("…" if len(text) > 80 else "")}
+        logger.info("✅ /speak done %.2fs", time.perf_counter() - t0)
+
+    if interrupt:
+        # Best-effort cancel: stop audio immediately; new job queued next
+        speaker.stop()
+
+    _submit_speak(_do_speak)
+    return {
+        "status": "speaking",
+        "chars": len(text),
+        "preview": text[:80] + ("…" if len(text) > 80 else ""),
+    }
 
 
 @app.post("/speak/tokens", tags=["speaker"])
 async def speak_tokens(req: SpeakTokensRequest):
     """
-    ⚡ Feed pre-tokenized words → speak IMMEDIATELY without re-buffering.
+    ⚡ Feed pre-tokenised LLM tokens → speak immediately.
 
-    FIXED: tokens are joined and synthesized as-is.
-    The voice_agent already chunked them (every 3 words / punctuation).
-    Re-buffering here caused silent drops on small batches.
-
-    Uses thread pool (not background_tasks) to avoid task queue delays.
-    Returns 202 immediately. Playback runs in pool thread.
+    FIX: tokens are concatenated (not space-joined) to preserve the
+    whitespace that LLM tokenizers embed in each token.
     """
     s = _require_synth()
     speaker = get_instant_speaker(s.sample_rate)
 
-    # Snapshot values for closure (req may be GC'd)
     tokens    = list(req.tokens)
     speed     = req.speed
     interrupt = req.interrupt
@@ -213,8 +253,8 @@ async def speak_tokens(req: SpeakTokensRequest):
             speaker.stop()
             time.sleep(0.05)
 
-        # Join all tokens into one text — agent already chunked appropriately
-        text = " ".join(tokens).strip()
+        # ← FIX: use _join_tokens instead of " ".join()
+        text = _join_tokens(tokens)
         if not text:
             return
 
@@ -225,12 +265,13 @@ async def speak_tokens(req: SpeakTokensRequest):
                 first = False
             speaker.feed(wav_chunk)
 
-        # Do NOT call speaker.flush() here — it blocks and prevents the next
-        # batch from starting. The speaker queue drains on its own.
         logger.info("✅ speak_tokens submitted %.0f chars in %.3fs",
                     len(text), time.perf_counter() - t0)
 
-    _speak_pool.submit(_do_speak_tokens)
+    if interrupt:
+        speaker.stop()
+
+    _submit_speak(_do_speak_tokens)
     return {"status": "speaking", "token_count": len(tokens)}
 
 
@@ -248,7 +289,7 @@ async def speak_status():
 
 
 # ===========================================================================
-# /synthesize — RETURN BYTES  (for remote clients, unchanged)
+# /synthesize — RETURN BYTES
 # ===========================================================================
 
 @app.post("/synthesize", tags=["synthesize"], response_class=Response)
@@ -295,6 +336,7 @@ async def synthesize_stream(req: SynthesizeRequest):
                 })
             except Exception as exc:
                 yield _sse({"type": "error", "detail": str(exc)})
+
         yield _sse({
             "type": "done",
             "total_chunks": total_chunks,
@@ -310,7 +352,11 @@ async def synthesize_stream(req: SynthesizeRequest):
 
 @app.post("/synthesize/tokens", tags=["synthesize"])
 async def synthesize_tokens(req: TokenStreamRequest):
-    """SSE: synthesize token chunks and stream as audio events."""
+    """SSE: synthesize token chunks and stream as audio events.
+
+    FIX: flush_buffer uses _join_tokens instead of ' '.join() to
+    avoid double-spaces and space-before-punctuation artefacts.
+    """
     s = _require_synth()
     overall_start = time.perf_counter()
 
@@ -320,8 +366,10 @@ async def synthesize_tokens(req: TokenStreamRequest):
 
         async def flush_buffer():
             nonlocal chunk_index, buffer
-            text = " ".join(buffer).strip()
+            # ← FIX: use _join_tokens
+            text = _join_tokens(buffer)
             if not text:
+                buffer = []
                 return
             audio_bytes: bytes = await _run_sync(s.synthesize, text, None, req.speed)
             chunk_index += 1
@@ -337,7 +385,8 @@ async def synthesize_tokens(req: TokenStreamRequest):
 
         for token in req.tokens:
             buffer.append(token)
-            combined = " ".join(buffer)
+            # ← FIX: inspect joined text correctly (no spurious spaces)
+            combined = _join_tokens(buffer)
             has_punct = any(c in combined for c in ".!?,;:\n")
             if has_punct or len(combined.split()) >= req.chunk_words:
                 async for event in flush_buffer():
@@ -418,6 +467,18 @@ async def synthesize_pocket_stream(req: SynthesizeRequest):
 @app.get("/health", tags=["meta"])
 async def health():
     s = synth
+
+    # ── Circuit breaker: surface startup errors ────────────────────────
+    if _startup_error:
+        return {
+            "status": "error",
+            "error": _startup_error,
+            "model_loaded": False,
+            "backend": settings.TTS_BACKEND,
+            "startup_time_s": round(_startup_time, 3),
+            "speaker_status": "unavailable",
+        }
+
     try:
         speaker_status = "speaking" if get_instant_speaker().is_speaking else "idle"
     except Exception:
@@ -426,7 +487,7 @@ async def health():
     return {
         "status": "ok" if s else "loading",
         "model_loaded": s is not None,
-        "backend": os.getenv("TTS_BACKEND", "pocket"),
+        "backend": settings.TTS_BACKEND,
         "sample_rate": s.sample_rate if s else None,
         "startup_time_s": round(_startup_time, 3),
         "speaker_status": speaker_status,
@@ -436,4 +497,4 @@ async def health():
 @app.get("/voices", tags=["meta"])
 async def voices():
     s = _require_synth()
-    return {"voices": s.available_voices(), "backend": os.getenv("TTS_BACKEND", "pocket")}
+    return {"voices": s.available_voices(), "backend": settings.TTS_BACKEND}

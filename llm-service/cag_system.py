@@ -301,7 +301,7 @@ class CAGSystemFreshSession:
             self.memory.add_message('assistant', answer)
 
             del input_ids, output_ids, attention_mask, inputs
-            self._aggressive_cleanup()
+            gc.collect()          # Python GC only — no CUDA round-trip per query
             self.cache_manager.truncate_to_knowledge()
 
             return {
@@ -411,7 +411,7 @@ class CAGSystemFreshSession:
                     self._advance_stage_after_response()
                     self.memory.add_message('assistant', response_text.strip())
                 del input_ids, attention_mask, inputs
-                self._aggressive_cleanup()
+                gc.collect()          # Python GC only — no CUDA round-trip per query
                 self.cache_manager.truncate_to_knowledge()
 
         except RuntimeError as e:
