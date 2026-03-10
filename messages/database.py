@@ -1,12 +1,16 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from models import Base
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-DATABASE_URL = "postgresql+psycopg2://postgres:balsem@localhost:5432/message_db"
+DATABASE_URL = "postgresql+psycopg2://postgres:balsem0404@localhost:5432/message_db"
 
-engine       = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+class Base(DeclarativeBase):
+    pass
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
 
 def get_db():
     db = SessionLocal()
@@ -14,8 +18,3 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-def init_db():
-    Base.metadata.create_all(bind=engine)
-    print("[MessageService] Tables ready.")
